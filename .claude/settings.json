@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e \"console.log\\(process.env.PAGOU_API_KEY ? 'key ok' : 'no key'\\)\")",
+      "Bash(node -e ' *)",
+      "Bash(node -e \"const QR=require\\('qrcode'\\); QR.toDataURL\\('teste123'\\).then\\(d=>console.log\\('OK, len='+d.length\\)\\).catch\\(e=>console.error\\('ERRO:',e.message\\)\\)\")",
+      "Bash(rtk ps *)",
+      "Bash(kill -SIGUSR1 67553)",
+      "Bash(node --inspect -e ' *)",
+      "Bash(kill 67553)",
+      "Bash(node server.js)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('qr_code presente:', bool\\(d.get\\('qr_code'\\)\\), '| pix:', d.get\\('pix',''\\)[:50] if d.get\\('pix'\\) else 'VAZIO'\\)\")",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('city:',d.get\\('city'\\),'region:',d.get\\('region'\\),'country:',d.get\\('country_code'\\)\\)\")"
+    ]
+  }
+}
