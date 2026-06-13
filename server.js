@@ -8,7 +8,8 @@ const app = express();
 app.use(express.json({ limit: "5mb" }));
 app.use(express.static(path.join(__dirname)));
 
-const PAGOU_BASE = (process.env.PAGOU_API_BASE_URL || "https://api.pagou.ai").replace(/\/$/, "");
+const BC_BASE = "https://api.blackcatpay.com.br/api";
+const BC_KEY = (process.env.BLACKCAT_API_KEY || "").trim();
 const UTMIFY_URL = "https://api.utmify.com.br/api-credentials/orders";
 const UTMIFY_TOKEN = (process.env.UTMIFY_API_TOKEN || "").trim();
 const SITE_URL = (process.env.SITE_URL || "http://localhost:" + (process.env.PORT || 3000)).replace(/\/$/, "");
@@ -38,24 +39,24 @@ function writePending(list) {
   fs.writeFileSync(PENDING_FILE, JSON.stringify(list), "utf8");
 }
 
-// ── Pagou API ─────────────────────────────────────────────────────────────────
+// ── BlackCat API ──────────────────────────────────────────────────────────────
 
-async function pagouRequest(method, endpoint, body, idempotencyKey) {
-  const url = `${PAGOU_BASE}${endpoint}`;
-  const headers = {
-    Authorization: `Bearer ${process.env.PAGOU_API_KEY}`,
-    "Content-Type": "application/json",
+async function bcRequest(method, endpoint, body) {
+  const url = `${BC_BASE}${endpoint}`;
+  const opts = {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "X-API-Key": BC_KEY,
+    },
   };
-  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
-
-  const opts = { method, headers };
   if (body) opts.body = JSON.stringify(body);
 
   const res = await fetch(url, opts);
   const json = await res.json();
 
   if (!res.ok || json.success === false) {
-    const err = new Error(json.message || json.title || "Pagou API error");
+    const err = new Error(json.message || "BlackCat API error");
     err.status = res.status;
     err.body = json;
     throw err;
@@ -70,7 +71,7 @@ function buildUtmifyPayload({ orderId, status, createdAt, approvedDate, customer
   const userCommission = Math.max(1, totalPriceInCents - gatewayFee);
   return {
     orderId: String(orderId),
-    platform: "GasECia",
+    platform: "DiskGasJosuel",
     paymentMethod: "pix",
     status,
     createdAt,
@@ -140,53 +141,63 @@ app.post("/api.json", async (req, res) => {
   const createdAt = toUtcDateTime(new Date());
   const cpfClean = (cpf || "").replace(/\D/g, "");
   const telClean = (telefone || "").replace(/\D/g, "");
+  const tracking = req.body.tracking || {};
 
   let transaction;
   try {
-    transaction = await pagouRequest(
-      "POST",
-      "/v2/transactions",
-      {
-        external_ref: orderId,
-        amount: amountCents,
-        currency: "BRL",
-        method: "pix",
-        description: "Pedido Gás & Cia",
-        notify_url: SITE_URL.startsWith("https://") ? `${SITE_URL}/api/webhooks/pagou` : undefined,
-        products: itens.length
-          ? itens.map((i) => ({
-              name: i.nome || i.name || "Item",
-              price: Math.round((i.preco || i.price || 0) * 100),
-              quantity: i.qty || i.quantidade || 1,
-            }))
-          : [{ name: "Pedido Gás & Cia", price: amountCents, quantity: 1 }],
-        buyer: {
-          name: nome,
-          email: "cliente@diskgasdojosuel.online",
-          phone: telClean || undefined,
-          document: cpfClean ? { type: "CPF", number: cpfClean } : undefined,
-        },
+    transaction = await bcRequest("POST", "/sales/create-sale", {
+      amount: amountCents,
+      currency: "BRL",
+      paymentMethod: "pix",
+      externalRef: orderId,
+      postbackUrl: SITE_URL.startsWith("https://") ? `${SITE_URL}/api/webhooks/blackcat` : undefined,
+      items: itens.length
+        ? itens.map((i) => ({
+            title: i.nome || i.name || "Item",
+            unitPrice: Math.round((i.preco || i.price || 0) * 100),
+            quantity: i.qty || i.quantidade || 1,
+            tangible: true,
+          }))
+        : [{ title: "Pedido Disk Gás", unitPrice: amountCents, quantity: 1, tangible: true }],
+      customer: {
+        name: nome,
+        email: "cliente@diskgasdojosuel.online",
+        phone: telClean || "00000000000",
+        document: { number: cpfClean || "00000000000", type: "cpf" },
       },
-      orderId
-    );
+      shipping: {
+        name: nome,
+        street: req.body.rua || "Não informado",
+        number: req.body.numero || "S/N",
+        neighborhood: req.body.bairro || "Não informado",
+        city: req.body.cidade || "Não informado",
+        state: req.body.estado || "SP",
+        zipCode: (req.body.cep || "00000000").replace(/\D/g, ""),
+      },
+      pix: { expiresInDays: 1 },
+      utm_source: tracking.utm_source || null,
+      utm_medium: tracking.utm_medium || null,
+      utm_campaign: tracking.utm_campaign || null,
+      utm_content: tracking.utm_content || null,
+      utm_term: tracking.utm_term || null,
+    });
   } catch (err) {
-    console.error("Pagou PIX error:", err.body || err.message);
+    console.error("BlackCat PIX error:", err.body || err.message);
     return res.status(502).json({ sucesso: false, erro: "Falha ao gerar PIX. Tente novamente." });
   }
 
-  const pixCode = transaction.pix_code || transaction.pix?.qr_code || "";
+  // BlackCat retorna paymentData.copyPaste e paymentData.qrCodeBase64
+  const pixCode = transaction.paymentData?.copyPaste || "";
+  const qrBase64 = transaction.paymentData?.qrCodeBase64 || null;
 
-  // Gera QR localmente — pix_qr_code da Pagou pode vir null
-  let qrImage = null;
-  if (pixCode) {
+  // Usa QR da BlackCat se disponível, senão gera localmente
+  let qrImage = qrBase64 || null;
+  if (!qrImage && pixCode) {
     try {
-      qrImage = await QRCode.toDataURL(pixCode, { width: 280, margin: 2, errorCorrectionLevel: "M" });
-      console.log("QR gerado OK, len=", qrImage.length);
+      qrImage = await QRCode.toDataURL(pixCode, { width: 280, margin: 2 });
     } catch (e) {
-      console.error("QR gen error:", e.message, e.stack);
+      console.error("QR gen error:", e.message);
     }
-  } else {
-    console.warn("pixCode vazio — QR não gerado. pix_code=", transaction.pix_code, "pix.qr_code=", transaction.pix?.qr_code);
   }
 
   // Envia "waiting_payment" para UTMify
@@ -199,22 +210,22 @@ app.post("/api.json", async (req, res) => {
           quantity: i.qty || i.quantidade || 1,
           priceInCents: Math.round((i.preco || i.price || 0) * 100),
         }))
-      : [{ id: orderId, name: "Pedido Gás & Cia", quantity: 1, priceInCents: amountCents }];
+      : [{ id: orderId, name: "Pedido Disk Gás", quantity: 1, priceInCents: amountCents }];
 
     const utmPayload = buildUtmifyPayload({
-      orderId: String(transaction.id),
+      orderId: String(transaction.transactionId),
       status: "waiting_payment",
       createdAt,
       approvedDate: null,
       customer: { name: nome, phone: telClean || null, document: null, ip: clientIp },
       products: utmProducts,
-      tracking: req.body.tracking || {},
+      tracking,
       totalPriceInCents: amountCents,
     });
     await sendToUtmify(utmPayload);
 
     const pending = readPending();
-    pending.push({ transactionId: String(transaction.id), createdAt, utmPayload });
+    pending.push({ transactionId: String(transaction.transactionId), createdAt, utmPayload });
     writePending(pending);
   }
 
@@ -222,7 +233,7 @@ app.post("/api.json", async (req, res) => {
     sucesso: true,
     pix: pixCode,
     qr_code: qrImage,
-    transacao_id: transaction.id,
+    transacao_id: transaction.transactionId,
   });
 });
 
@@ -235,40 +246,38 @@ app.get("/api.php", async (req, res) => {
   }
 
   try {
-    const tx = await pagouRequest("GET", `/v2/transactions/${id}`);
-    const pago = ["paid", "captured", "authorized"].includes(tx.status);
-    const expirado = ["canceled", "expired", "refused", "refunded"].includes(tx.status);
+    const tx = await bcRequest("GET", `/sales/${id}/status`);
+    const pago = tx.status === "PAID";
+    const expirado = ["CANCELLED", "REFUNDED"].includes(tx.status);
     return res.json({ pago, expirado, status: tx.status });
   } catch (err) {
-    console.error("Pagou status error:", err.body || err.message);
+    console.error("BlackCat status error:", err.body || err.message);
     return res.status(502).json({ erro: "Falha ao consultar pagamento." });
   }
 });
 
-// ── POST /api/webhooks/pagou ──────────────────────────────────────────────────
+// ── POST /api/webhooks/blackcat ───────────────────────────────────────────────
 
 const seenWebhooks = new Set();
 
-app.post("/api/webhooks/pagou", (req, res) => {
+app.post("/api/webhooks/blackcat", (req, res) => {
   res.json({ received: true });
 
   const event = req.body;
-  const eventId = event?.id;
-  if (!eventId || seenWebhooks.has(eventId)) return;
-  seenWebhooks.add(eventId);
+  // BlackCat: header X-Webhook-Event = "transaction.paid", deduplicar por transactionId
+  const eventType = req.headers["x-webhook-event"] || "";
+  const transactionId = String(event?.transactionId || event?.data?.transactionId || "");
+
+  if (!transactionId || seenWebhooks.has(transactionId)) return;
+  seenWebhooks.add(transactionId);
 
   setImmediate(async () => {
-    // doc Pagou: roteamento por event.event + data.event_type
-    const eventType = event.event || event.type || "";
-    const eventSubType = event.data?.event_type || "";
-    console.log(`[webhook] event=${eventType} event_type=${eventSubType} id=${eventId}`);
+    console.log(`[webhook] event=${eventType} transactionId=${transactionId}`);
 
-    const isPaid = eventType === "transaction" &&
-      (eventSubType === "transaction.paid" || event.data?.status === "paid");
+    const isPaid = eventType === "transaction.paid" || event?.status === "PAID";
 
     if (isPaid && UTMIFY_TOKEN) {
-      const transactionId = String(event.data?.id || "");
-      const paidAt = event.data?.paid_at;
+      const paidAt = event?.paidAt || event?.data?.paidAt;
       const approvedDate = paidAt ? toUtcDateTime(new Date(paidAt)) : toUtcDateTime(new Date());
 
       const pending = readPending();
@@ -284,17 +293,16 @@ app.post("/api/webhooks/pagou", (req, res) => {
 // ── Polling fallback UTMify ───────────────────────────────────────────────────
 
 async function pollPending() {
-  if (!UTMIFY_TOKEN || !process.env.PAGOU_API_KEY) return;
+  if (!UTMIFY_TOKEN || !BC_KEY) return;
   const pending = readPending();
   if (!pending.length) return;
 
   const stillPending = [];
   for (const row of pending) {
     try {
-      const tx = await pagouRequest("GET", `/v2/transactions/${row.transactionId}`);
-      const paid = ["paid", "captured", "authorized"].includes(tx.status);
-      if (paid) {
-        const paidAt = tx.paid_at;
+      const tx = await bcRequest("GET", `/sales/${row.transactionId}/status`);
+      if (tx.status === "PAID") {
+        const paidAt = tx.paidAt;
         const approvedDate = paidAt ? toUtcDateTime(new Date(paidAt)) : toUtcDateTime(new Date());
         await sendToUtmify({ ...row.utmPayload, status: "paid", approvedDate });
         console.log(`UTMify polling: ${row.transactionId} confirmado`);
@@ -313,8 +321,8 @@ async function pollPending() {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Gás & Cia rodando na porta ${PORT}`);
-  console.log(`Pagou: ${PAGOU_BASE}`);
+  console.log(`Disk Gás do Josuel rodando na porta ${PORT}`);
+  console.log(`BlackCat: ${BC_BASE}`);
   if (UTMIFY_TOKEN) {
     console.log("UTMify: ativo — pedidos serão enviados ao painel.");
     setInterval(pollPending, POLL_INTERVAL_MS);
