@@ -8,8 +8,8 @@ const app = express();
 app.use(express.json({ limit: "5mb" }));
 app.use(express.static(path.join(__dirname)));
 
-const BC_BASE = "https://api.blackcatpay.com.br/api";
-const BC_KEY = (process.env.BLACKCAT_API_KEY || "").trim();
+const MP_BASE = "https://api.somosmarcha.com/api/v1";
+const MP_KEY = (process.env.MARCHA_API_KEY || "").trim();
 const UTMIFY_URL = "https://api.utmify.com.br/api-credentials/orders";
 const UTMIFY_TOKEN = (process.env.UTMIFY_API_TOKEN || "").trim();
 const SITE_URL = (process.env.SITE_URL || "http://localhost:" + (process.env.PORT || 3000)).replace(/\/$/, "");
@@ -39,15 +39,16 @@ function writePending(list) {
   fs.writeFileSync(PENDING_FILE, JSON.stringify(list), "utf8");
 }
 
-// ── BlackCat API ──────────────────────────────────────────────────────────────
+// ── MarchaPay API ─────────────────────────────────────────────────────────────
 
-async function bcRequest(method, endpoint, body) {
-  const url = `${BC_BASE}${endpoint}`;
+async function mpRequest(method, endpoint, body) {
+  const url = `${MP_BASE}${endpoint}`;
   const opts = {
     method,
     headers: {
       "Content-Type": "application/json",
-      "X-API-Key": BC_KEY,
+      "Accept": "application/json",
+      "Authorization": `Bearer ${MP_KEY}`,
     },
   };
   if (body) opts.body = JSON.stringify(body);
@@ -55,8 +56,8 @@ async function bcRequest(method, endpoint, body) {
   const res = await fetch(url, opts);
   const json = await res.json();
 
-  if (!res.ok || json.success === false) {
-    const err = new Error(json.message || "BlackCat API error");
+  if (!res.ok) {
+    const err = new Error(json.message || "MarchaPay API error");
     err.status = res.status;
     err.body = json;
     throw err;
@@ -145,53 +146,40 @@ app.post("/api.json", async (req, res) => {
 
   let transaction;
   try {
-    transaction = await bcRequest("POST", "/sales/create-sale", {
-      amount: amountCents,
-      currency: "BRL",
-      paymentMethod: "pix",
-      externalRef: orderId,
-      postbackUrl: SITE_URL.startsWith("https://") ? `${SITE_URL}/api/webhooks/blackcat` : undefined,
-      items: itens.length
-        ? itens.map((i) => ({
-            title: i.nome || i.name || "Item",
-            unitPrice: Math.round((i.preco || i.price || 0) * 100),
-            quantity: i.qty || i.quantidade || 1,
-            tangible: true,
-          }))
-        : [{ title: "Pedido Disk Gás", unitPrice: amountCents, quantity: 1, tangible: true }],
+    const webhookSecret = process.env.MARCHA_WEBHOOK_SECRET || "";
+    const postbackUrl = SITE_URL.startsWith("https://")
+      ? `${SITE_URL}/api/webhooks/marcha${webhookSecret ? `?token=${webhookSecret}` : ""}`
+      : undefined;
+
+    transaction = await mpRequest("POST", "/sellers/orders/", {
       customer: {
         name: nome,
+        tax_id: cpfClean || "00000000000",
         email: "cliente@diskgasdojosuel.online",
-        phone: telClean || "00000000000",
-        document: { number: cpfClean || "00000000000", type: "cpf" },
+        phone: telClean || undefined,
+        address: {
+          street: req.body.rua || "Não informado",
+          number: req.body.numero || "S/N",
+          neighborhood: req.body.bairro || "Não informado",
+          city: req.body.cidade || "Não informado",
+          state: (req.body.estado || "SP").toUpperCase(),
+          postal_code: (req.body.cep || "00000000").replace(/\D/g, ""),
+        },
       },
-      shipping: {
-        name: nome,
-        street: req.body.rua || "Não informado",
-        number: req.body.numero || "S/N",
-        neighborhood: req.body.bairro || "Não informado",
-        city: req.body.cidade || "Não informado",
-        state: req.body.estado || "SP",
-        zipCode: (req.body.cep || "00000000").replace(/\D/g, ""),
-      },
-      pix: { expiresInDays: 1 },
-      utm_source: tracking.utm_source || null,
-      utm_medium: tracking.utm_medium || null,
-      utm_campaign: tracking.utm_campaign || null,
-      utm_content: tracking.utm_content || null,
-      utm_term: tracking.utm_term || null,
+      items: [],
+      payment: { gross_amount: amountCents },
+      postback_url: postbackUrl,
     });
   } catch (err) {
-    console.error("BlackCat PIX error:", err.body || err.message);
+    console.error("MarchaPay PIX error:", err.body || err.message);
     return res.status(502).json({ sucesso: false, erro: "Falha ao gerar PIX. Tente novamente." });
   }
 
-  // BlackCat retorna paymentData.copyPaste e paymentData.qrCodeBase64
-  const pixCode = transaction.paymentData?.copyPaste || "";
-  const qrBase64 = transaction.paymentData?.qrCodeBase64 || null;
+  // MarchaPay retorna pix.copy_and_paste e pix.qr_code_image_base64 (base64 puro, sem prefixo)
+  const pixCode = transaction.pix?.copy_and_paste || "";
+  const qrBase64Raw = transaction.pix?.qr_code_image_base64 || null;
 
-  // Usa QR da BlackCat se disponível, senão gera localmente
-  let qrImage = qrBase64 || null;
+  let qrImage = qrBase64Raw ? `data:image/png;base64,${qrBase64Raw}` : null;
   if (!qrImage && pixCode) {
     try {
       qrImage = await QRCode.toDataURL(pixCode, { width: 280, margin: 2 });
@@ -213,7 +201,7 @@ app.post("/api.json", async (req, res) => {
       : [{ id: orderId, name: "Pedido Disk Gás", quantity: 1, priceInCents: amountCents }];
 
     const utmPayload = buildUtmifyPayload({
-      orderId: String(transaction.transactionId),
+      orderId: String(transaction.uuid),
       status: "waiting_payment",
       createdAt,
       approvedDate: null,
@@ -225,7 +213,7 @@ app.post("/api.json", async (req, res) => {
     await sendToUtmify(utmPayload);
 
     const pending = readPending();
-    pending.push({ transactionId: String(transaction.transactionId), createdAt, utmPayload });
+    pending.push({ transactionId: String(transaction.uuid), createdAt, utmPayload });
     writePending(pending);
   }
 
@@ -233,7 +221,7 @@ app.post("/api.json", async (req, res) => {
     sucesso: true,
     pix: pixCode,
     qr_code: qrImage,
-    transacao_id: transaction.transactionId,
+    transacao_id: transaction.uuid,
   });
 });
 
@@ -246,45 +234,54 @@ app.get("/api.php", async (req, res) => {
   }
 
   try {
-    const tx = await bcRequest("GET", `/sales/${id}/status`);
-    const pago = tx.status === "PAID";
-    const expirado = ["CANCELLED", "REFUNDED"].includes(tx.status);
-    return res.json({ pago, expirado, status: tx.status });
+    const tx = await mpRequest("GET", `/sellers/orders/${id}/`);
+    const status = tx.payment?.status || tx.status || "";
+    const pago = status === "PAID";
+    const expirado = ["CANCELLED", "REFUNDED", "EXPIRED", "CHARGEBACK"].includes(status);
+    return res.json({ pago, expirado, status });
   } catch (err) {
-    console.error("BlackCat status error:", err.body || err.message);
+    console.error("MarchaPay status error:", err.body || err.message);
     return res.status(502).json({ erro: "Falha ao consultar pagamento." });
   }
 });
 
-// ── POST /api/webhooks/blackcat ───────────────────────────────────────────────
+// ── POST /api/webhooks/marcha ─────────────────────────────────────────────────
 
 const seenWebhooks = new Set();
 
-app.post("/api/webhooks/blackcat", (req, res) => {
+app.post("/api/webhooks/marcha", (req, res) => {
+  // Valida token secreto na query string (MarchaPay não envia HMAC no postback por pedido)
+  const webhookSecret = process.env.MARCHA_WEBHOOK_SECRET || "";
+  if (webhookSecret && req.query.token !== webhookSecret) {
+    return res.status(401).json({ erro: "Token inválido." });
+  }
+
   res.json({ received: true });
 
-  const event = req.body;
-  // BlackCat: header X-Webhook-Event = "transaction.paid", deduplicar por transactionId
-  const eventType = req.headers["x-webhook-event"] || "";
-  const transactionId = String(event?.transactionId || event?.data?.transactionId || "");
+  const body = req.body;
+  const eventType = req.headers["x-webhook-event"] || body?.event || "";
+  // Deduplica pelo X-Webhook-Event-Id (conforme docs MarchaPay)
+  const eventId = req.headers["x-webhook-event-id"] || "";
+  const orderUuid = String(body?.data?.order?.uuid || "");
 
-  if (!transactionId || seenWebhooks.has(transactionId)) return;
-  seenWebhooks.add(transactionId);
+  const dedupeKey = eventId || orderUuid;
+  if (!dedupeKey || seenWebhooks.has(dedupeKey)) return;
+  seenWebhooks.add(dedupeKey);
 
   setImmediate(async () => {
-    console.log(`[webhook] event=${eventType} transactionId=${transactionId}`);
+    console.log(`[webhook] event=${eventType} order=${orderUuid}`);
 
-    const isPaid = eventType === "transaction.paid" || event?.status === "PAID";
+    const isPaid = eventType === "order.paid" || body?.data?.order?.status === "PAID";
 
     if (isPaid && UTMIFY_TOKEN) {
-      const paidAt = event?.paidAt || event?.data?.paidAt;
+      const paidAt = body?.data?.order?.paid_at || body?.occurred_at;
       const approvedDate = paidAt ? toUtcDateTime(new Date(paidAt)) : toUtcDateTime(new Date());
 
       const pending = readPending();
-      const row = pending.find((r) => r.transactionId === transactionId);
+      const row = pending.find((r) => r.transactionId === orderUuid);
       if (row) {
         await sendToUtmify({ ...row.utmPayload, status: "paid", approvedDate });
-        writePending(pending.filter((r) => r.transactionId !== transactionId));
+        writePending(pending.filter((r) => r.transactionId !== orderUuid));
       }
     }
   });
@@ -293,16 +290,17 @@ app.post("/api/webhooks/blackcat", (req, res) => {
 // ── Polling fallback UTMify ───────────────────────────────────────────────────
 
 async function pollPending() {
-  if (!UTMIFY_TOKEN || !BC_KEY) return;
+  if (!UTMIFY_TOKEN || !MP_KEY) return;
   const pending = readPending();
   if (!pending.length) return;
 
   const stillPending = [];
   for (const row of pending) {
     try {
-      const tx = await bcRequest("GET", `/sales/${row.transactionId}/status`);
-      if (tx.status === "PAID") {
-        const paidAt = tx.paidAt;
+      const tx = await mpRequest("GET", `/sellers/orders/${row.transactionId}/`);
+      const status = tx.payment?.status || tx.status || "";
+      if (status === "PAID") {
+        const paidAt = tx.timestamps?.paid_at;
         const approvedDate = paidAt ? toUtcDateTime(new Date(paidAt)) : toUtcDateTime(new Date());
         await sendToUtmify({ ...row.utmPayload, status: "paid", approvedDate });
         console.log(`UTMify polling: ${row.transactionId} confirmado`);
@@ -322,7 +320,7 @@ async function pollPending() {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Disk Gás do Josuel rodando na porta ${PORT}`);
-  console.log(`BlackCat: ${BC_BASE}`);
+  console.log(`MarchaPay: ${MP_BASE}`);
   if (UTMIFY_TOKEN) {
     console.log("UTMify: ativo — pedidos serão enviados ao painel.");
     setInterval(pollPending, POLL_INTERVAL_MS);
